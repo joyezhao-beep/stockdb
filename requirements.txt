@@ -1,5 +1,8 @@
 streamlit
+baostock
+easyquotation
 akshare
-yfinance
-plotly
 pandas
+numpy
+plotly
+requests
