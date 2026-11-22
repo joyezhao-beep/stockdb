@@ -96,9 +96,9 @@ with tab_a:
 
         try:
             st.markdown("##### 两融余额")
-            # ✅ 修改接口为 stock_margin_sse
             margin = ak.stock_margin_sse()
-            fig_margin = px.line(margin, x="日期", y="融资余额", title="全市场融资余额")
+            # ✅ 这里修正：时间列是【信用交易日期】，不是“日期”
+            fig_margin = px.line(margin, x="信用交易日期", y="融资余额", title="全市场融资余额")
             st.plotly_chart(fig_margin, use_container_width=True)
         except Exception as e:
             st.warning(f"两融数据失败：{e}")
@@ -120,7 +120,7 @@ with tab_a:
         st.markdown("##### 估值提示")
         st.info("PE/PB分位数、ERP股债溢价，免费akshare公开数据源有限，预留面板位置")
 
-        # ---- 趋势动量 RPS，增加 trade_df 判断，修复变量作用域报错
+        # ---- 趋势动量 RPS
         if trade_df is not None and len(trade_df) > 0:
             try:
                 trade_df["ma20"] = trade_df["收盘"].rolling(20).mean()
