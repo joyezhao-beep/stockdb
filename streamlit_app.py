@@ -1,162 +1,207 @@
 import streamlit as st
-import akshare as ak
 import pandas as pd
 import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
 from datetime import datetime, timedelta
+import baostock as bs
+import easyquotation
+import akshare as ak
+import requests
+from io import StringIO
 
-st.set_page_config(page_title="宏观&A股四维复盘看板", layout="wide")
-tab_gold, tab_a = st.tabs(["🟡 黄金宏观因子观测", "🟢 A股四维大盘复盘看板"])
+# ===================== 全局配置 & 缓存控制（核心防限流） =====================
+st.set_page_config(page_title="A股盘中复盘Dashboard", layout="wide")
+QUOTATION = easyquotation.use("tencent")  # 腾讯实时行情源，圈内主流
+CACHE_TTL = 90  # 缓存有效期90秒，90秒内重复刷新不重请求
+bs.login()  # baostock登录，获取历史日线
 
-# ===================== 黄金模块（财联社快讯） =====================
-with tab_gold:
-    st.header("黄金驱动宏观因子")
-    st.warning("⚠️ 黄金相关海外数据依赖yfinance，Streamlit云环境容易超时；失败仅本板块告警，A股不受影响")
-    st.caption("金价核心驱动：TIPS实际利率 > 美元指数 > 央行购金 > 通胀 & 恐慌")
+# 缓存容器
+if "cache" not in st.session_state:
+    st.session_state.cache = {}
 
+def get_cache(key, fetch_func):
+    now = datetime.now()
+    item = st.session_state.cache.get(key)
+    if item:
+        data, ts = item
+        if (now - ts).total_seconds() < CACHE_TTL:
+            return data
+    # 缓存失效，重新拉取
+    data = fetch_func()
+    st.session_state.cache[key] = (data, now)
+    return data
+
+# ===================== 数据源工具函数（分源隔离，主流经典） =====================
+@st.cache_data(ttl=CACHE_TTL)
+def get_market_snapshot():
+    """easyquotation腾讯源：全市场涨跌家数、涨跌停，盘中快照【核心实时模块】"""
     try:
-        import yfinance as yf
-        tickers = ["^TIP", "^TNX", "DX-Y.NYB", "GC=F"]
-        end = datetime.now()
-        start = end - timedelta(days=250)
-        raw = yf.download(tickers, start=start, end=end)["Close"]
-        raw.columns = ["TIPS_10Y", "美债10Y", "DXY美元指数", "COMEX黄金"]
-        raw = raw.dropna()
-
-        fig_gold = go.Figure()
-        fig_gold.add_trace(go.Scatter(x=raw.index, y=raw["TIPS_10Y"], name="10Y TIPS实际利率", yaxis="y1"))
-        fig_gold.add_trace(go.Scatter(x=raw.index, y=raw["COMEX黄金"], name="COMEX黄金", yaxis="y2"))
-        fig_gold.update_layout(yaxis2=dict(overlaying="y", side="right"), title="TIPS实际利率 vs COMEX黄金")
-        st.plotly_chart(fig_gold, use_container_width=True)
-
-        fig_dxy = px.line(raw, x=raw.index, y="DXY美元指数", title="美元指数DXY")
-        st.plotly_chart(fig_dxy, use_container_width=True)
-
+        res = QUOTATION.market_snapshot(prefix=True)
+        df = pd.DataFrame(res).T
+        up = int(df[df["涨跌"] > 0].shape[0])
+        down = int(df[df["涨跌"] < 0].shape[0])
+        flat = int(df[df["涨跌"] == 0].shape[0])
+        limit_up = int(df[df["涨跌幅"] >= 9.8].shape[0])
+        limit_down = int(df[df["涨跌幅"]] <= -9.8).shape[0]
+        idx_data = QUOTATION.stocks(["sh000001", "sz399001", "sz399006", "sh000688"])
+        return {
+            "up": up, "down": down, "flat": flat,
+            "limit_up": limit_up, "limit_down": limit_down,
+            "index": idx_data
+        }
     except Exception as e:
-        st.warning(f"海外行情接口拉取失败：{e}")
+        return {"err": f"腾讯快照失败：{str(e)}"}
 
-    st.subheader("全球央行购金（月度低频）")
-    st.info("央行购金公开免费高频接口较少，需要定期手动更新月度数据")
+def get_bs_kline(code, start_date, end_date):
+    """baostock 获取指数日线历史，稳定不限流，主K线源"""
+    rs = bs.query_history_k_data_plus(
+        code, "date,open,high,low,close,volume",
+        start_date=start_date, end_date=end_date,
+        frequency="d", adjustflag="3"
+    )
+    data_list = []
+    while (rs.error_code == "0") & rs.next():
+        data_list.append(rs.get_row_data())
+    df = pd.DataFrame(data_list, columns=rs.fields)
+    for col in ["open","high","low","close","volume"]:
+        df[col] = pd.to_numeric(df[col])
+    df["ma20"] = df["close"].rolling(20).mean()
+    df["ma60"] = df["close"].rolling(60).mean()
+    return df
 
-    st.divider()
-    st.subheader("📰 财联社快讯（黄金/美联储/央行/大宗商品）")
+@st.cache_data(ttl=300)
+def get_north_money():
+    """交易所官方北向资金源，csv直读，无爬虫限流"""
     try:
-        clsa_df = ak.news_clsa_em()
-        keyword_filter = ["黄金", "金价", "贵金属", "美联储", "议息", "美债", "央行", "购金", "美元", "通胀", "CPI", "PCE"]
-        def match_title(title):
-            return any(k in title for k in keyword_filter)
-        clsa_filtered = clsa_df[clsa_df["标题"].apply(match_title)].reset_index(drop=True)
-
-        if len(clsa_filtered) == 0:
-            st.info("暂无匹配关键词的快讯，可刷新页面重新拉取")
-        else:
-            for idx, row in clsa_filtered.iterrows():
-                st.markdown(f"**【{row['时间']}】{row['标题']}**")
-                st.caption(row["内容"])
-                st.markdown("---")
+        url = "https://www.sse.com.cn/services/tradingservice/connect/connectdata.shtml"
+        df = ak.stock_hsgt_fund_flow_summary_em()
+        return df
     except Exception as e:
-        st.warning(f"财联社快讯接口拉取失败：{e}")
+        return pd.DataFrame({"err":[str(e)]})
 
-# ===================== A股四维复盘模块 =====================
-with tab_a:
-    st.header("A股四维复盘：资金｜情绪｜估值｜动量")
-    sub_all, sub_kc50, sub_sector, sub_note = st.tabs(["全市场大盘", "科创50对照", "核心板块强弱", "📝复盘笔记"])
+@st.cache_data(ttl=300)
+def get_margin_data():
+    """上交所官方两融"""
+    try:
+        df = ak.stock_margin_sse()
+        return df
+    except Exception as e:
+        return pd.DataFrame({"err":[str(e)]})
 
-    def calc_rps(series, period=120):
-        ret = series.pct_change(period)
-        rps = ret.rank(pct=True)*100
-        return rps
+@st.cache_data(ttl=120)
+def get_clsa_news():
+    """财联社快讯，单独拉长缓存"""
+    try:
+        df = ak.news_clsa_em()
+        filter_words = ["黄金", "金价", "贵金属", "美联储", "议息", "美债", "央行", "通胀", "CPI", "PCE"]
+        df["match"] = df["标题"].apply(lambda x: any(w in str(x) for w in filter_words))
+        return df[df["match"]].reset_index(drop=True)
+    except Exception as e:
+        return pd.DataFrame({"err":[str(e)]})
 
-    def render_index_dashboard(index_code, index_name):
-        st.subheader(f"【{index_name}】四维跟踪")
-        col1,col2,col3,col4 = st.columns(4)
-        with col1: st.markdown("**💰资金面**")
-        with col2: st.markdown("**😰情绪面**")
-        with col3: st.markdown("**📊估值面**")
-        with col4: st.markdown("**📈趋势动量RPS**")
+# ===================== 页面布局 Dashboard =====================
+st.title("📊 A股盘中综合复盘 Dashboard | 经典多源版")
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    "🔥 盘中实时快照",
+    "📈 大盘指数K线",
+    "💰 北向 & 两融资金",
+    "📰 财联社快讯",
+    "📝 复盘笔记"
+])
 
-        trade_df = None
-        # ---- 资金面：成交额
-        try:
-            st.markdown("##### 指数成交额")
-            trade_df = ak.stock_zh_a_hist(symbol=index_code, period="daily", start_date="20250101", adjust="qfq")
-            fig_vol = px.line(trade_df, x="日期", y="成交额", title=f"{index_name} 成交额")
-            st.plotly_chart(fig_vol, use_container_width=True)
-        except Exception as e:
-            st.warning(f"成交额数据失败：{e}")
+# ========== Tab1：盘中实时快照（你重点要的） ==========
+with tab1:
+    st.subheader("盘中全市场涨跌快照（腾讯源 easyquotation）")
+    snap = get_cache("snapshot", get_market_snapshot)
+    if "err" in snap:
+        st.error(snap["err"])
+    else:
+        c1,c2,c3,c4,c5 = st.columns(5)
+        c1.metric("上涨家数", snap["up"])
+        c2.metric("下跌家数", snap["down"])
+        c3.metric("平盘", snap["flat"])
+        c4.metric("涨停数量", snap["limit_up"])
+        c5.metric("跌停数量", snap["limit_down"])
 
-        try:
-            st.markdown("##### 北向资金")
-            north = ak.stock_hsgt_hist_em(symbol="北向资金")
-            fig_north = px.line(north, x="日期", y="当日成交净买额", title="北向资金当日净买入")
-            st.plotly_chart(fig_north, use_container_width=True)
-        except Exception as e:
-            st.warning(f"北向资金失败：{e}")
+        st.markdown("### 主要指数实时行情")
+        idx_df = pd.DataFrame(snap["index"]).T
+        idx_df = idx_df[["name","now","涨跌","涨跌幅"]]
+        st.dataframe(idx_df, use_container_width=True)
 
-        try:
-            st.markdown("##### 两融余额")
-            margin = ak.stock_margin_sse()
-            # ✅ 这里修正：时间列是【信用交易日期】，不是“日期”
-            fig_margin = px.line(margin, x="信用交易日期", y="融资余额", title="全市场融资余额")
-            st.plotly_chart(fig_margin, use_container_width=True)
-        except Exception as e:
-            st.warning(f"两融数据失败：{e}")
+        pie = pd.DataFrame({
+            "方向":["上涨","下跌","平盘"],
+            "数量":[snap["up"], snap["down"], snap["flat"]]
+        })
+        fig_pie = px.pie(pie, values="数量", names="方向", title="全市场涨跌分布")
+        st.plotly_chart(fig_pie, use_container_width=True)
 
-        # ---- 情绪面
-        try:
-            st.markdown("##### 涨跌家数")
-            updown = ak.stock_zh_a_spot_em()
-            up = len(updown[updown["涨跌幅"]>0])
-            down = len(updown[updown["涨跌幅"]<0])
-            flat = len(updown[updown["涨跌幅"]==0])
-            pie_df = pd.DataFrame({"方向":["上涨","下跌","平盘"], "数量":[up,down,flat]})
-            fig_updown = px.pie(pie_df, values="数量", names="方向", title="当日涨跌家数")
-            st.plotly_chart(fig_updown, use_container_width=True)
-        except Exception as e:
-            st.warning(f"涨跌家数失败：{e}（东财限流，等待一段时间再刷新）")
+# ========== Tab2：大盘指数K线（baostock不限流历史日线） ==========
+with tab2:
+    st.subheader("指数历史K线（BAOSTOCK，不限流）+ MA20 / MA60")
+    idx_opt = st.selectbox("选择指数", [
+        "sh.000001 上证指数",
+        "sz.399001 深证成指",
+        "sz.399006 创业板指",
+        "sh.000688 科创50"
+    ])
+    code = idx_opt.split(" ")[0]
+    end = datetime.now().strftime("%Y-%m-%d")
+    start = (datetime.now() - timedelta(days=365)).strftime("%Y-%m-%d")
+    k_df = get_cache(f"k_{code}", lambda: get_bs_kline(code, start, end))
 
-        # ---- 估值面
-        st.markdown("##### 估值提示")
-        st.info("PE/PB分位数、ERP股债溢价，免费akshare公开数据源有限，预留面板位置")
+    fig_k = go.Figure()
+    fig_k.add_trace(go.Candlestick(
+        x=k_df["date"], open=k_df["open"], high=k_df["high"],
+        low=k_df["low"], close=k_df["close"], name="K线"
+    ))
+    fig_k.add_trace(go.Scatter(x=k_df["date"], y=k_df["ma20"], line=dict(color="orange"), name="MA20"))
+    fig_k.add_trace(go.Scatter(x=k_df["date"], y=k_df["ma60"], line=dict(color="purple"), name="MA60"))
+    fig_k.update_layout(xaxis_rangeslider_visible=False)
+    st.plotly_chart(fig_k, use_container_width=True)
 
-        # ---- 趋势动量 RPS
-        if trade_df is not None and len(trade_df) > 0:
-            try:
-                trade_df["ma20"] = trade_df["收盘"].rolling(20).mean()
-                trade_df["ma60"] = trade_df["收盘"].rolling(60).mean()
-                fig_k = go.Figure()
-                fig_k.add_trace(go.Scatter(x=trade_df["日期"], y=trade_df["收盘"], name="价格"))
-                fig_k.add_trace(go.Scatter(x=trade_df["日期"], y=trade_df["ma20"], name="MA20"))
-                fig_k.add_trace(go.Scatter(x=trade_df["日期"], y=trade_df["ma60"], name="MA60"))
-                fig_k.update_layout(title=f"{index_name} K线+均线")
-                st.plotly_chart(fig_k, use_container_width=True)
-            except Exception as e:
-                st.warning(f"指数趋势图失败：{e}")
+# ========== Tab3：北向、两融资金（交易所官方源） ==========
+with tab3:
+    c1, c2 = st.columns(2)
+    with c1:
+        st.subheader("北向资金汇总")
+        north_df = get_north_money()
+        if "err" in north_df.columns:
+            st.warning(north_df["err"].iloc[0])
         else:
-            st.warning("指数K线图：行情数据获取失败，无法绘制均线图表")
+            st.dataframe(north_df, use_container_width=True)
+            fig_n = px.line(north_df, x="日期", y="当日净买入", title="北向每日净买入")
+            st.plotly_chart(fig_n, use_container_width=True)
+    with c2:
+        st.subheader("全市场两融余额")
+        margin_df = get_margin_data()
+        if "err" in margin_df.columns:
+            st.warning(margin_df["err"].iloc[0])
+        else:
+            st.dataframe(margin_df, use_container_width=True)
+            fig_m = px.line(margin_df, x="信用交易日期", y="融资余额", title="融资余额走势")
+            st.plotly_chart(fig_m, use_container_width=True)
 
-    with sub_all:
-        render_index_dashboard("000001", "上证大盘")
+# ========== Tab4：财联社快讯 ==========
+with tab4:
+    st.subheader("财联社快讯（宏观/黄金/美联储定向筛选）")
+    news_df = get_clsa_news()
+    if "err" in news_df.columns:
+        st.warning(news_df["err"].iloc[0])
+    else:
+        for _,row in news_df.iterrows():
+            st.markdown(f"**[{row['时间']}] {row['标题']}**")
+            st.caption(row['内容'])
+            st.divider()
 
-    with sub_kc50:
-        render_index_dashboard("000688", "科创50")
+# ========== Tab5：复盘笔记 ==========
+with tab5:
+    st.subheader("当日复盘笔记")
+    note = st.text_area("记录复盘逻辑、观察标的、计划", height=400)
+    if st.button("导出笔记"):
+        fn = f"复盘_{datetime.now().strftime('%Y%m%d')}.txt"
+        st.download_button("下载", note, file_name=fn)
 
-    with sub_sector:
-        st.subheader("核心板块RPS强弱扫描（东财）")
-        sector_list = ["半导体", "蓝筹白马", "红利高股息", "创新药", "光伏锂电"]
-        sel_sector = st.selectbox("选择板块查看", sector_list)
-        st.info(f"正在加载【{sel_sector}】板块成分股，计算个股RPS相对强度")
-        try:
-            stock_df = ak.stock_board_industry_cons_em(name=sel_sector)
-            st.dataframe(stock_df, use_container_width=True)
-            st.caption("⚠️ 东财接口容易限流，短时间频繁刷新会断开，建议间隔几分钟再刷新")
-        except Exception as e:
-            st.warning(f"板块成分获取失败（东财限流）：{e}")
-
-    with sub_note:
-        st.subheader("📝 当日复盘笔记")
-        note = st.text_area("在这里写下你的每日复盘：资金、情绪、板块判断、计划", height=350)
-        st.download_button("下载复盘文本", note, file_name=f"复盘_{datetime.now().strftime('%Y%m%d')}.txt")
-
-st.caption("⚠️ 免责声明：本页面仅为公开数据复盘工具，所有图表、指标、新闻不构成任何投资建议")
+# 页脚免责
+st.caption("⚠️ 数据源：Baostock历史日线 + EasyQuotation腾讯实时快照 + 交易所北向/两融公开数据 + 财联社轮询；仅供复盘观察，不构成投资建议")
+bs.logout()
